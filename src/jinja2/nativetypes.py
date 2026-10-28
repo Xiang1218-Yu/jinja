@@ -102,7 +102,8 @@ class NativeTemplate(Template):
         with :func:`ast.literal_eval`, the parsed value is returned.
         Otherwise, the string is returned.
         """
-        ctx = self.new_context(dict(*args, **kwargs))
+        vars = self._prepare_context_vars(dict(*args, **kwargs))
+        ctx = self.new_context(vars)
 
         try:
             return self.environment_class.concat(  # type: ignore
@@ -117,7 +118,8 @@ class NativeTemplate(Template):
                 "The environment was not created with async mode enabled."
             )
 
-        ctx = self.new_context(dict(*args, **kwargs))
+        vars = self._prepare_context_vars(dict(*args, **kwargs))
+        ctx = self.new_context(vars)
 
         try:
             return self.environment_class.concat(  # type: ignore

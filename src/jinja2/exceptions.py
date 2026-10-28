@@ -164,3 +164,50 @@ class FilterArgumentError(TemplateRuntimeError):
     """This error is raised if a filter was called with inappropriate
     arguments
     """
+
+
+class ContractValidationError(TemplateError):
+    """Raised before rendering when the context passed to a template does
+    not satisfy its declared :class:`~jinja2.contract.ContextContract`.
+
+    The exception is raised *before* any template code runs, so no
+    partial output is produced. :attr:`violations` contains every problem
+    found during validation, not just the first one.
+
+    .. versionadded:: 3.2
+    """
+
+    def __init__(
+        self,
+        violations: t.Sequence["ContractViolation"],
+        template_name: str | None = None,
+    ) -> None:
+        self.violations: list[ContractViolation] = list(violations)
+        self.template: str | None = template_name
+        super().__init__(self._build_message())
+
+    def _build_message(self) -> str:
+        lines = []
+
+        if self.template is not None:
+            lines.append(
+                f"Context contract validation failed for template"
+                f" {self.template!r} with {len(self.violations)} violation(s):"
+            )
+        else:
+            lines.append(
+                f"Context contract validation failed with"
+                f" {len(self.violations)} violation(s):"
+            )
+
+        for violation in self.violations:
+            lines.append(f"- {violation.message}")
+
+        return "\n".join(lines)
+
+    def __str__(self) -> str:
+        return t.cast(str, self.message)
+
+
+if t.TYPE_CHECKING:
+    from .contract import ContractViolation

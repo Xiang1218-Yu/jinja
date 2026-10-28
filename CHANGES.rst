@@ -13,6 +13,19 @@ Unreleased
 -   Use modern packaging metadata with ``pyproject.toml`` instead of ``setup.cfg``.
     :pr:`1793`
 -   Use ``flit_core`` instead of ``setuptools`` as build backend.
+-   Add opt-in template context contracts. A ``ContextContract`` declares
+    required and optional fields, default values, basic types, nested
+    objects, list element types and an unknown field policy. When attached
+    to a template (``Environment(context_contract=...)``,
+    ``env.from_string(..., context_contract=...)`` or
+    ``env.set_context_contract(name, contract)``), the whole render context
+    is validated before ``render`` or ``render_async`` runs any template
+    code; failures raise ``ContractValidationError`` with structured
+    violations (field path, actual type, reason, template name). Contracts
+    follow explicit inheritance rules for ``extends``, ``include`` and
+    ``import`` (with or without context); macro arguments are not part of
+    the context contract. The feature is disabled by default and does not
+    change existing behavior or performance.
 
 
 Version 3.1.6

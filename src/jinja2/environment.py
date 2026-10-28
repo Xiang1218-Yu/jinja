@@ -59,6 +59,7 @@ if t.TYPE_CHECKING:
     import typing_extensions as te
 
     from .bccache import BytecodeCache
+    from .contract import ContextContract
     from .ext import Extension
     from .loaders import BaseLoader
 
@@ -262,6 +263,13 @@ class Environment:
         `enable_async`
             If set to true this enables async template execution which
             allows using async functions and generators.
+
+        `context_contract`
+            A :class:`~jinja2.contract.ContextContract` used as the
+            default for renders that start on templates without their
+            own contract. Disabled (``None``) by default.
+
+            .. versionadded:: 3.2
     """
 
     #: if this environment is sandboxed.  Modifying this variable won't make
@@ -316,6 +324,7 @@ class Environment:
         auto_reload: bool = True,
         bytecode_cache: t.Optional["BytecodeCache"] = None,
         enable_async: bool = False,
+        context_contract: t.Optional["ContextContract"] = None,
     ):
         # !!Important notice!!
         #   The constructor accepts quite a few arguments that should be
@@ -366,7 +375,36 @@ class Environment:
         self.extensions = load_extensions(self, extensions)
 
         self.is_async = enable_async
+
+        # template context contracts (disabled by default)
+        self.context_contract: ContextContract | None = context_contract
+        self.context_contracts: dict[str, ContextContract] = {}
+
         _environment_config_check(self)
+
+    def set_context_contract(
+        self, name: str, contract: "ContextContract | None"
+    ) -> None:
+        """Register (or remove with ``None``) the context contract used
+        for the loaded template called ``name``.
+
+        Contracts registered here are used when that template is the
+        render entry point or is reached through ``extends``,
+        ``include`` or ``import``.
+
+        .. versionadded:: 3.2
+        """
+        if contract is None:
+            self.context_contracts.pop(name, None)
+        else:
+            self.context_contracts[name] = contract
+
+    def get_context_contract(self, name: str) -> "ContextContract | None":
+        """Return the contract registered for template ``name``, if any.
+
+        .. versionadded:: 3.2
+        """
+        return self.context_contracts.get(name)
 
     def add_extension(self, extension: str | type["Extension"]) -> None:
         """Adds an extension after the environment was created.
@@ -408,6 +446,7 @@ class Environment:
         auto_reload: bool = missing,
         bytecode_cache: t.Optional["BytecodeCache"] = missing,
         enable_async: bool = missing,
+        context_contract: t.Optional["ContextContract"] = missing,
     ) -> "te.Self":
         """Create a new overlay environment that shares all the data with the
         current environment except for cache and the overridden attributes.
@@ -428,12 +467,20 @@ class Environment:
             and ``enable_async`` parameters to match ``__init__``.
         """
         args = dict(locals())
-        del args["self"], args["cache_size"], args["extensions"], args["enable_async"]
+        del (
+            args["self"],
+            args["cache_size"],
+            args["extensions"],
+            args["enable_async"],
+        )
 
         rv = object.__new__(self.__class__)
         rv.__dict__.update(self.__dict__)
         rv.overlayed = True
         rv.linked_to = self
+        # contract registrations on the overlay must not modify the
+        # original environment
+        rv.context_contracts = dict(self.context_contracts)
 
         for key, value in args.items():
             if value is not missing:
@@ -1091,6 +1138,7 @@ class Environment:
         source: str | nodes.Template,
         globals: t.MutableMapping[str, t.Any] | None = None,
         template_class: type["Template"] | None = None,
+        context_contract: t.Optional["ContextContract"] = None,
     ) -> "Template":
         """Load a template from a source string without using
         :attr:`loader`.
@@ -1102,10 +1150,18 @@ class Environment:
             cached, its globals are updated with any new items.
         :param template_class: Return an instance of this
             :class:`Template` class.
+        :param context_contract: Validate the render context against
+            this :class:`~jinja2.contract.ContextContract` before
+            rendering. Disabled by default.
+
+        .. versionchanged:: 3.2
+            Added the ``context_contract`` parameter.
         """
         gs = self.make_globals(globals)
         cls = template_class or self.template_class
-        return cls.from_code(self, self.compile(source), gs, None)
+        rv = cls.from_code(self, self.compile(source), gs, None)
+        rv.context_contract = context_contract
+        return rv
 
     def make_globals(
         self, d: t.MutableMapping[str, t.Any] | None
@@ -1157,6 +1213,8 @@ class Template:
     filename: str | None
     blocks: dict[str, t.Callable[[Context], t.Iterator[str]]]
     root_render_func: t.Callable[[Context], t.Iterator[str]]
+    context_contract: t.Optional["ContextContract"]
+    _contract_refs: tuple[tuple[str, str, bool, bool, bool], ...]
     _module: t.Optional["TemplateModule"]
     _debug_info: str
     _uptodate: t.Callable[[], bool] | None
@@ -1182,6 +1240,7 @@ class Template:
         finalize: t.Callable[..., t.Any] | None = None,
         autoescape: bool | t.Callable[[str | None], bool] = False,
         enable_async: bool = False,
+        context_contract: t.Optional["ContextContract"] = None,
     ) -> t.Any:  # it returns a `Template`, but this breaks the sphinx build...
         env = get_spontaneous_environment(
             cls.environment_class,  # type: ignore
@@ -1208,7 +1267,9 @@ class Template:
             None,
             enable_async,
         )
-        return env.from_string(source, template_class=cls)
+        return env.from_string(
+            source, template_class=cls, context_contract=context_contract
+        )
 
     @classmethod
     def from_code(
@@ -1263,6 +1324,11 @@ class Template:
         t._debug_info = namespace["debug_info"]
         t._uptodate = None
 
+        # context contracts are attached after creation; static template
+        # references are emitted by the compiler when available
+        t.context_contract = None
+        t._contract_refs = namespace.get("contract_refs", ())
+
         # store the reference
         namespace["environment"] = environment
         namespace["__jinja_template__"] = t
@@ -1284,7 +1350,8 @@ class Template:
 
             return asyncio.run(self.render_async(*args, **kwargs))
 
-        ctx = self.new_context(dict(*args, **kwargs))
+        vars = self._prepare_context_vars(dict(*args, **kwargs))
+        ctx = self.new_context(vars)
 
         try:
             return self.environment.concat(self.root_render_func(ctx))  # type: ignore
@@ -1305,7 +1372,8 @@ class Template:
                 "The environment was not created with async mode enabled."
             )
 
-        ctx = self.new_context(dict(*args, **kwargs))
+        vars = self._prepare_context_vars(dict(*args, **kwargs))
+        ctx = self.new_context(vars)
 
         try:
             return self.environment.concat(  # type: ignore
@@ -1337,7 +1405,8 @@ class Template:
             yield from asyncio.run(to_list())
             return
 
-        ctx = self.new_context(dict(*args, **kwargs))
+        vars = self._prepare_context_vars(dict(*args, **kwargs))
+        ctx = self.new_context(vars)
 
         try:
             yield from self.root_render_func(ctx)
@@ -1355,7 +1424,8 @@ class Template:
                 "The environment was not created with async mode enabled."
             )
 
-        ctx = self.new_context(dict(*args, **kwargs))
+        vars = self._prepare_context_vars(dict(*args, **kwargs))
+        ctx = self.new_context(vars)
 
         try:
             agen: t.AsyncGenerator[str, None] = self.root_render_func(ctx)  # type: ignore[assignment]
@@ -1365,6 +1435,27 @@ class Template:
                     yield event
         except Exception:
             yield self.environment.handle_exception()
+
+    def _prepare_context_vars(self, vars: dict[str, t.Any]) -> dict[str, t.Any]:
+        """Validate ``vars`` against the effective context contract and
+        return the variables to create the render context with.
+
+        Returns the same mapping unchanged when no contract applies,
+        preserving the existing behavior and performance. Any
+        :class:`~jinja2.exceptions.ContractValidationError` is raised
+        here, before ``root_render_func`` is touched, so no template code
+        runs and no partial output can be produced.
+        """
+        if (
+            self.context_contract is None
+            and self.environment.context_contract is None
+            and not self.environment.context_contracts
+        ):
+            return vars
+
+        from .contract import prepare_render_context
+
+        return prepare_render_context(self, vars)
 
     def new_context(
         self,

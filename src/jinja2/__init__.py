@@ -10,8 +10,13 @@ import typing as t
 from .bccache import BytecodeCache as BytecodeCache
 from .bccache import FileSystemBytecodeCache as FileSystemBytecodeCache
 from .bccache import MemcachedBytecodeCache as MemcachedBytecodeCache
+from .contract import ContextContract as ContextContract
+from .contract import ContractField as ContractField
+from .contract import ContractViolation as ContractViolation
+from .contract import UnknownFields as UnknownFields
 from .environment import Environment as Environment
 from .environment import Template as Template
+from .exceptions import ContractValidationError as ContractValidationError
 from .exceptions import TemplateAssertionError as TemplateAssertionError
 from .exceptions import TemplateError as TemplateError
 from .exceptions import TemplateNotFound as TemplateNotFound

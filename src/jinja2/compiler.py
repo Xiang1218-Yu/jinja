@@ -122,6 +122,85 @@ def generate(
     return None
 
 
+# Node types that introduce a local scope. Variables referenced inside
+# them (loop targets, macro or call arguments) are provided at runtime,
+# not through the render-entry context.
+_CONTRACT_SCOPE_NODES = (nodes.For, nodes.Macro, nodes.CallBlock)
+_CONTRACT_REF_NODES = (
+    nodes.Extends,
+    nodes.Include,
+    nodes.Import,
+    nodes.FromImport,
+)
+
+
+def find_contract_refs(
+    ast: nodes.Template,
+) -> tuple[tuple[str, str, bool, bool, bool], ...]:
+    """Collect the statically known template references of ``ast`` for
+    context contract inheritance.
+
+    Each entry is a tuple ``(kind, template_name, with_context,
+    ignore_missing, local_scope)`` where ``kind`` is one of
+    ``"extends"``, ``"include"``, ``"import"`` or ``"from_import"`` and
+    ``local_scope`` marks references nested inside a ``for``, macro or
+    call scope (or a ``scoped`` block). Dynamically computed template
+    names cannot be resolved statically and are omitted.
+    """
+    refs: list[tuple[str, str, bool, bool, bool]] = []
+
+    def walk(node: nodes.Node, scoped: bool) -> None:
+        if isinstance(node, _CONTRACT_SCOPE_NODES) or (
+            isinstance(node, nodes.Block) and node.scoped
+        ):
+            scoped = True
+
+        if isinstance(node, _CONTRACT_REF_NODES):
+            if isinstance(node, nodes.Extends):
+                kind, with_context, ignore_missing = ("extends", True, False)
+            elif isinstance(node, nodes.Include):
+                kind, with_context, ignore_missing = (
+                    "include",
+                    node.with_context,
+                    node.ignore_missing,
+                )
+            elif isinstance(node, nodes.Import):
+                kind, with_context, ignore_missing = (
+                    "import",
+                    node.with_context,
+                    False,
+                )
+            else:
+                kind, with_context, ignore_missing = (
+                    "from_import",
+                    node.with_context,
+                    False,
+                )
+
+            template = node.template
+
+            if isinstance(template, nodes.Const):
+                candidates: list[t.Any] = [template.value]
+            elif isinstance(template, (nodes.Tuple, nodes.List)):
+                candidates = [
+                    item.value
+                    for item in template.items
+                    if isinstance(item, nodes.Const)
+                ]
+            else:
+                candidates = []
+
+            for candidate in candidates:
+                if isinstance(candidate, str):
+                    refs.append((kind, candidate, with_context, ignore_missing, scoped))
+
+        for child in node.iter_child_nodes():
+            walk(child, scoped)
+
+    walk(ast, False)
+    return tuple(refs)
+
+
 def has_safe_repr(value: t.Any) -> bool:
     """Does the node have a safe representation?"""
     if value is None or value is NotImplemented or value is Ellipsis:
@@ -941,6 +1020,10 @@ class CodeGenerator(NodeVisitor):
         self.writeline(f"blocks = {{{blocks_kv_str}}}", extra=1)
         debug_kv_str = "&".join(f"{k}={v}" for k, v in self.debug_info)
         self.writeline(f"debug_info = {debug_kv_str!r}")
+
+        # static extends/include/import references used for context
+        # contract inheritance resolution before rendering
+        self.writeline(f"contract_refs = {find_contract_refs(node)!r}")
 
     def visit_Block(self, node: nodes.Block, frame: Frame) -> None:
         """Call a block and register it for the template."""
