@@ -82,6 +82,8 @@ class EvalContext:
         else:
             self.autoescape = environment.autoescape
         self.volatile = False
+        #: Active render tracing session (jinja2.trace), if any.
+        self._trace: t.Any = None
 
     def save(self) -> t.Mapping[str, t.Any]:
         return self.__dict__.copy()

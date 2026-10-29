@@ -16,6 +16,7 @@ from .exceptions import TemplateNotFound  # noqa: F401
 from .exceptions import TemplateRuntimeError  # noqa: F401
 from .exceptions import UndefinedError
 from .nodes import EvalContext
+from .trace import null_trace
 from .utils import _PassArg
 from .utils import concat
 from .utils import internalcode
@@ -98,6 +99,7 @@ def new_context(
     shared: bool = False,
     globals: t.MutableMapping[str, t.Any] | None = None,
     locals: t.Mapping[str, t.Any] | None = None,
+    trace: t.Any = None,
 ) -> "Context":
     """Internal helper for context creation."""
     if vars is None:
@@ -115,7 +117,7 @@ def new_context(
             if value is not missing:
                 parent[key] = value
     return environment.context_class(
-        environment, parent, template_name, blocks, globals=globals
+        environment, parent, template_name, blocks, globals=globals, trace=trace
     )
 
 
@@ -169,6 +171,7 @@ class Context:
         name: str | None,
         blocks: dict[str, t.Callable[["Context"], t.Iterator[str]]],
         globals: t.MutableMapping[str, t.Any] | None = None,
+        trace: t.Any = None,
     ):
         self.parent = parent
         self.vars: dict[str, t.Any] = {}
@@ -177,6 +180,13 @@ class Context:
         self.exported_vars: set[str] = set()
         self.name = name
         self.globals_keys = set() if globals is None else set(globals)
+
+        # Active render tracing session, or the shared no-op session when
+        # tracing was compiled in but no session was passed.
+        self._trace = trace if trace is not None else null_trace
+        # Macros receive the eval context but not the context, so mirror the
+        # session there for runtime instrumentation.
+        self.eval_ctx._trace = self._trace
 
         # create the initial mapping of blocks.  Whenever template inheritance
         # takes place the runtime will update this mapping with the new blocks
@@ -313,7 +323,14 @@ class Context:
         template that is independent.
         """
         context = new_context(
-            self.environment, self.name, {}, self.get_all(), True, None, locals
+            self.environment,
+            self.name,
+            {},
+            self.get_all(),
+            True,
+            None,
+            locals,
+            trace=self._trace,
         )
         context.eval_ctx = self.eval_ctx
         context.blocks.update((k, list(v)) for k, v in self.blocks.items())
@@ -672,6 +689,7 @@ class Macro:
         catch_varargs: bool,
         caller: bool,
         default_autoescape: bool | None = None,
+        origin: str | None = None,
     ):
         self._environment = environment
         self._func = func
@@ -682,6 +700,8 @@ class Macro:
         self.catch_varargs = catch_varargs
         self.caller = caller
         self.explicit_caller = "caller" in arguments
+        #: Name of the template that defines the macro (tracing only).
+        self._origin = origin
 
         if default_autoescape is None:
             if callable(environment.autoescape):
@@ -711,10 +731,32 @@ class Macro:
         # that if no eval context is passed we fall back to the compile
         # time autoescape flag.
         if args and isinstance(args[0], EvalContext):
-            autoescape = args[0].autoescape
+            eval_ctx = args[0]
+            autoescape = eval_ctx.autoescape
             args = args[1:]
+            # The session is normally taken from the *calling* render's
+            # eval context, so a macro imported from a cached module is
+            # traced by the render that invokes it.
+            trace = (
+                getattr(eval_ctx, "_trace", None)
+                if getattr(self._environment, "enable_trace", False)
+                else None
+            )
         else:
             autoescape = self._default_autoescape
+            trace = None
+
+        # A macro defined in an imported (cached) module closes over that
+        # module's detached context, but nested calls (e.g. caller()) still
+        # belong to the render driving the invocation.
+        if (trace is None or not trace.active) and getattr(
+            self._environment, "enable_trace", False
+        ):
+            from .trace import current_session
+
+            current = current_session()
+            if current is not None and current.active:
+                trace = current
 
         # try to consume the positional arguments
         arguments = list(args[: self._argument_count])
@@ -767,9 +809,25 @@ class Macro:
                 f" {len(self.arguments)} argument(s)"
             )
 
-        return self._invoke(arguments, autoescape)
+        return self._invoke(arguments, autoescape, trace)
 
-    async def _async_invoke(self, arguments: list[t.Any], autoescape: bool) -> str:
+    async def _async_invoke(
+        self,
+        arguments: list[t.Any],
+        trace: t.Any | None = None,
+        autoescape: bool = False,
+    ) -> str:
+        if trace is not None and trace.active:
+            return t.cast(
+                str,
+                await trace.invoke_macro_async(
+                    self.name,
+                    self._origin,
+                    lambda: self._func(*arguments),
+                    autoescape,
+                ),
+            )
+
         rv = await self._func(*arguments)  # type: ignore
 
         if autoescape:
@@ -777,9 +835,27 @@ class Macro:
 
         return rv  # type: ignore
 
-    def _invoke(self, arguments: list[t.Any], autoescape: bool) -> str:
+    def _invoke(
+        self,
+        arguments: list[t.Any],
+        autoescape: bool,
+        trace: t.Any | None = None,
+    ) -> str:
         if self._environment.is_async:
-            return self._async_invoke(arguments, autoescape)  # type: ignore
+            return self._async_invoke(  # type: ignore
+                arguments, trace=trace, autoescape=autoescape
+            )
+
+        if trace is not None and trace.active:
+            return t.cast(
+                str,
+                trace.invoke_macro_sync(
+                    self.name,
+                    self._origin,
+                    lambda: self._func(*arguments),
+                    autoescape,
+                ),
+            )
 
         rv = self._func(*arguments)
 

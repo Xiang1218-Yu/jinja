@@ -13,6 +13,15 @@ Unreleased
 -   Use modern packaging metadata with ``pyproject.toml`` instead of ``setup.cfg``.
     :pr:`1793`
 -   Use ``flit_core`` instead of ``setuptools`` as build backend.
+-   Add an opt-in render event tracing facility. Create an environment
+    with ``Environment(enable_trace=True)`` and pass a
+    ``jinja2.trace.RenderTrace`` session to ``render``, ``render_async``,
+    ``generate`` or ``stream`` to record template, extends, include,
+    import, macro, block and output events in execution order, with
+    sequence numbers, template identities, nesting depth, sync/async
+    state, event/output limits, cancellation and structured errors.
+    Tracing is inactive by default and does not alter rendering when
+    unused.
 
 
 Version 3.1.6

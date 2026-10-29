@@ -32,6 +32,13 @@ from .runtime import DebugUndefined as DebugUndefined
 from .runtime import make_logging_undefined as make_logging_undefined
 from .runtime import StrictUndefined as StrictUndefined
 from .runtime import Undefined as Undefined
+from .trace import RenderTrace as RenderTrace
+from .trace import RenderTraceError as RenderTraceError
+from .trace import TraceCancelledError as TraceCancelledError
+from .trace import TraceEvent as TraceEvent
+from .trace import TraceLimitError as TraceLimitError
+from .trace import TraceObserver as TraceObserver
+from .trace import TraceRejectedError as TraceRejectedError
 from .utils import clear_caches as clear_caches
 from .utils import is_undefined as is_undefined
 from .utils import pass_context as pass_context

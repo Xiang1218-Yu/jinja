@@ -8,6 +8,7 @@ import typing as t
 import weakref
 from collections import ChainMap
 from contextlib import aclosing
+from contextlib import contextmanager
 from functools import lru_cache
 from functools import partial
 from functools import reduce
@@ -316,6 +317,7 @@ class Environment:
         auto_reload: bool = True,
         bytecode_cache: t.Optional["BytecodeCache"] = None,
         enable_async: bool = False,
+        enable_trace: bool = False,
     ):
         # !!Important notice!!
         #   The constructor accepts quite a few arguments that should be
@@ -366,6 +368,7 @@ class Environment:
         self.extensions = load_extensions(self, extensions)
 
         self.is_async = enable_async
+        self.enable_trace = enable_trace
         _environment_config_check(self)
 
     def add_extension(self, extension: str | type["Extension"]) -> None:
@@ -408,6 +411,7 @@ class Environment:
         auto_reload: bool = missing,
         bytecode_cache: t.Optional["BytecodeCache"] = missing,
         enable_async: bool = missing,
+        enable_trace: bool = missing,
     ) -> "te.Self":
         """Create a new overlay environment that shares all the data with the
         current environment except for cache and the overridden attributes.
@@ -1160,6 +1164,8 @@ class Template:
     _module: t.Optional["TemplateModule"]
     _debug_info: str
     _uptodate: t.Callable[[], bool] | None
+    #: True when the compiled code contains render tracing instrumentation.
+    _trace_compiled: bool = False
 
     def __new__(
         cls,
@@ -1182,6 +1188,7 @@ class Template:
         finalize: t.Callable[..., t.Any] | None = None,
         autoescape: bool | t.Callable[[str | None], bool] = False,
         enable_async: bool = False,
+        enable_trace: bool = False,
     ) -> t.Any:  # it returns a `Template`, but this breaks the sphinx build...
         env = get_spontaneous_environment(
             cls.environment_class,  # type: ignore
@@ -1207,6 +1214,7 @@ class Template:
             False,
             None,
             enable_async,
+            enable_trace,
         )
         return env.from_string(source, template_class=cls)
 
@@ -1263,13 +1271,40 @@ class Template:
         t._debug_info = namespace["debug_info"]
         t._uptodate = None
 
+        # whether the compiled code was generated with tracing hooks
+        t._trace_compiled = namespace.get("__jinja_trace__", False)
+
         # store the reference
         namespace["environment"] = environment
         namespace["__jinja_template__"] = t
 
         return t
 
-    def render(self, *args: t.Any, **kwargs: t.Any) -> str:
+    def _prepare_trace(self, trace: t.Any) -> t.Any:
+        """Normalize a user supplied trace argument for this template."""
+        if trace is None:
+            return None
+        if not getattr(self.environment, "enable_trace", False):
+            raise RuntimeError(
+                "Render tracing requires an environment created with"
+                " Environment(enable_trace=True)."
+            )
+        from .trace import normalize_trace
+
+        return normalize_trace(trace)
+
+    @contextmanager
+    def _trace_isolation(self, session: t.Any) -> t.Iterator[None]:
+        """Hide an outer session for an untraced (nested) render."""
+        if session is None and getattr(self.environment, "enable_trace", False):
+            from .trace import no_session
+
+            with no_session():
+                yield
+        else:
+            yield
+
+    def render(self, *args: t.Any, trace: t.Any = None, **kwargs: t.Any) -> str:
         """This method accepts the same arguments as the `dict` constructor:
         A dict, a dict subclass or some keyword arguments.  If no arguments
         are given the context will be empty.  These two calls do the same::
@@ -1278,20 +1313,50 @@ class Template:
             template.render({'knights': 'that say nih'})
 
         This will return the rendered template as a string.
+
+        Pass an enabled :class:`~jinja2.trace.RenderTrace` session (or an
+        observer/callable) as ``trace`` to record render events for this
+        call only.
         """
+        session = self._prepare_trace(trace)
+
         if self.environment.is_async:
             import asyncio
 
-            return asyncio.run(self.render_async(*args, **kwargs))
+            return asyncio.run(self.render_async(*args, trace=session, **kwargs))
 
-        ctx = self.new_context(dict(*args, **kwargs))
+        ctx = self.new_context(dict(*args, **kwargs), trace=session)
 
+        if session is not None:
+            return self._render_traced(ctx, session)
+
+        with self._trace_isolation(None):
+            try:
+                return self.environment.concat(  # type: ignore
+                    self.root_render_func(ctx)
+                )
+            except Exception:
+                self.environment.handle_exception()
+
+    def _render_traced(self, ctx: Context, session: t.Any) -> str:
+        session.begin("render", self, is_async=False)
+        gen = t.cast("t.Generator[str, None, None]", self.root_render_func(ctx))
+        pieces: list[str] = []
         try:
-            return self.environment.concat(self.root_render_func(ctx))  # type: ignore
-        except Exception:
-            self.environment.handle_exception()
+            with session.activate():
+                for piece in gen:
+                    session.output(piece)
+                    pieces.append(piece)
+            return self.environment.concat(pieces)  # type: ignore
+        except BaseException as exc:
+            self._safe_close_sync(gen)
+            raise session.fail(exc) from exc
+        finally:
+            session.finish()
 
-    async def render_async(self, *args: t.Any, **kwargs: t.Any) -> str:
+    async def render_async(
+        self, *args: t.Any, trace: t.Any = None, **kwargs: t.Any
+    ) -> str:
         """This works similar to :meth:`render` but returns a coroutine
         that when awaited returns the entire rendered template string.  This
         requires the async feature to be enabled.
@@ -1305,22 +1370,73 @@ class Template:
                 "The environment was not created with async mode enabled."
             )
 
-        ctx = self.new_context(dict(*args, **kwargs))
+        session = self._prepare_trace(trace)
+        ctx = self.new_context(dict(*args, **kwargs), trace=session)
 
+        if session is not None:
+            return await self._render_async_traced(ctx, session)
+
+        with self._trace_isolation(None):
+            try:
+                return self.environment.concat(  # type: ignore
+                    [n async for n in self.root_render_func(ctx)]  # type: ignore
+                )
+            except Exception:
+                return self.environment.handle_exception()
+
+    async def _render_async_traced(self, ctx: Context, session: t.Any) -> str:
+        import asyncio
+
+        session.begin("render", self, is_async=True)
+        agen: t.AsyncGenerator[str, None] = self.root_render_func(ctx)  # type: ignore
+        pieces: list[str] = []
         try:
-            return self.environment.concat(  # type: ignore
-                [n async for n in self.root_render_func(ctx)]  # type: ignore
-            )
-        except Exception:
-            return self.environment.handle_exception()
+            with session.activate():
+                async with aclosing(agen):
+                    async for piece in agen:
+                        session.output(piece)
+                        pieces.append(piece)
+            return self.environment.concat(pieces)  # type: ignore
+        except (Exception, asyncio.CancelledError) as exc:
+            await self._safe_aclose(agen)
+            raise session.fail(exc) from exc
+        except GeneratorExit:
+            session.mark_closed()
+            raise
+        finally:
+            session.finish()
 
-    def stream(self, *args: t.Any, **kwargs: t.Any) -> "TemplateStream":
+    @staticmethod
+    def _safe_close_sync(gen: t.Generator[str, None, None]) -> None:
+        try:
+            gen.close()
+        except Exception:
+            pass
+
+    @staticmethod
+    async def _safe_aclose(agen: t.AsyncGenerator[str, t.Any]) -> None:
+        try:
+            await agen.aclose()
+        except Exception:
+            pass
+
+    def stream(
+        self, *args: t.Any, trace: t.Any = None, **kwargs: t.Any
+    ) -> "TemplateStream":
         """Works exactly like :meth:`generate` but returns a
         :class:`TemplateStream`.
         """
-        return TemplateStream(self.generate(*args, **kwargs))
+        return TemplateStream(
+            self.generate(*args, trace=trace, _trace_entry="stream", **kwargs)
+        )
 
-    def generate(self, *args: t.Any, **kwargs: t.Any) -> t.Iterator[str]:
+    def generate(
+        self,
+        *args: t.Any,
+        trace: t.Any = None,
+        _trace_entry: str = "generate",
+        **kwargs: t.Any,
+    ) -> t.Iterator[str]:
         """For very large templates it can be useful to not render the whole
         template at once but evaluate each statement after another and yield
         piece for piece.  This method basically does exactly that and returns
@@ -1332,20 +1448,50 @@ class Template:
             import asyncio
 
             async def to_list() -> list[str]:
-                return [x async for x in self.generate_async(*args, **kwargs)]
+                return [
+                    x
+                    async for x in self.generate_async(
+                        *args, trace=trace, _trace_entry=_trace_entry, **kwargs
+                    )
+                ]
 
             yield from asyncio.run(to_list())
             return
 
-        ctx = self.new_context(dict(*args, **kwargs))
+        session = self._prepare_trace(trace)
+        ctx = self.new_context(dict(*args, **kwargs), trace=session)
 
+        if session is None:
+            with self._trace_isolation(None):
+                try:
+                    yield from self.root_render_func(ctx)
+                except Exception:
+                    yield self.environment.handle_exception()
+            return
+
+        session.begin(_trace_entry, self, is_async=False)
+        gen = t.cast("t.Generator[str, None, None]", self.root_render_func(ctx))
         try:
-            yield from self.root_render_func(ctx)
-        except Exception:
-            yield self.environment.handle_exception()
+            with session.activate():
+                for piece in gen:
+                    session.output(piece)
+                    yield piece
+        except GeneratorExit:
+            self._safe_close_sync(gen)
+            session.mark_closed()
+            return
+        except BaseException as exc:
+            self._safe_close_sync(gen)
+            raise session.fail(exc) from exc
+        finally:
+            session.finish()
 
     async def generate_async(
-        self, *args: t.Any, **kwargs: t.Any
+        self,
+        *args: t.Any,
+        trace: t.Any = None,
+        _trace_entry: str = "generate",
+        **kwargs: t.Any,
     ) -> t.AsyncGenerator[str, object]:
         """An async version of :meth:`generate`.  Works very similarly but
         returns an async iterator instead.
@@ -1355,22 +1501,47 @@ class Template:
                 "The environment was not created with async mode enabled."
             )
 
-        ctx = self.new_context(dict(*args, **kwargs))
+        session = self._prepare_trace(trace)
+        ctx = self.new_context(dict(*args, **kwargs), trace=session)
 
+        if session is None:
+            with self._trace_isolation(None):
+                try:
+                    agen: t.AsyncGenerator[str, None] = self.root_render_func(ctx)  # type: ignore[assignment]
+
+                    async with aclosing(agen):
+                        async for event in agen:
+                            yield event
+                except Exception:
+                    yield self.environment.handle_exception()
+            return
+
+        import asyncio
+
+        session.begin(_trace_entry, self, is_async=True)
+        agen = self.root_render_func(ctx)  # type: ignore[assignment]
         try:
-            agen: t.AsyncGenerator[str, None] = self.root_render_func(ctx)  # type: ignore[assignment]
-
-            async with aclosing(agen):
-                async for event in agen:
-                    yield event
-        except Exception:
-            yield self.environment.handle_exception()
+            with session.activate():
+                async with aclosing(agen):
+                    async for piece in agen:
+                        session.output(piece)
+                        yield piece
+        except (Exception, asyncio.CancelledError) as exc:
+            await self._safe_aclose(agen)
+            raise session.fail(exc) from exc
+        except GeneratorExit:
+            await self._safe_aclose(agen)
+            session.mark_closed()
+            raise
+        finally:
+            session.finish()
 
     def new_context(
         self,
         vars: dict[str, t.Any] | None = None,
         shared: bool = False,
         locals: t.Mapping[str, t.Any] | None = None,
+        trace: t.Any = None,
     ) -> Context:
         """Create a new :class:`Context` for this template.  The vars
         provided will be passed to the template.  Per default the globals
@@ -1380,7 +1551,14 @@ class Template:
         `locals` can be a dict of local variables for internal usage.
         """
         return new_context(
-            self.environment, self.name, self.blocks, vars, shared, self.globals, locals
+            self.environment,
+            self.name,
+            self.blocks,
+            vars,
+            shared,
+            self.globals,
+            locals,
+            trace=trace,
         )
 
     def make_module(
@@ -1388,6 +1566,8 @@ class Template:
         vars: dict[str, t.Any] | None = None,
         shared: bool = False,
         locals: t.Mapping[str, t.Any] | None = None,
+        *,
+        trace: t.Any = None,
     ) -> "TemplateModule":
         """This method works like the :attr:`module` attribute when called
         without arguments but it will evaluate the template on every call
@@ -1395,7 +1575,11 @@ class Template:
         a dict which is then used as context.  The arguments are the same
         as for the :meth:`new_context` method.
         """
-        ctx = self.new_context(vars, shared, locals)
+        ctx = self.new_context(vars, shared, locals, trace=trace)
+        session = getattr(ctx, "_trace", None)
+        if session is not None and session.active:
+            with session.module_purpose(self):
+                return TemplateModule(self, ctx)
         return TemplateModule(self, ctx)
 
     async def make_module_async(
@@ -1403,13 +1587,23 @@ class Template:
         vars: dict[str, t.Any] | None = None,
         shared: bool = False,
         locals: t.Mapping[str, t.Any] | None = None,
+        *,
+        trace: t.Any = None,
     ) -> "TemplateModule":
         """As template module creation can invoke template code for
         asynchronous executions this method must be used instead of the
         normal :meth:`make_module` one.  Likewise the module attribute
         becomes unavailable in async mode.
         """
-        ctx = self.new_context(vars, shared, locals)
+        ctx = self.new_context(vars, shared, locals, trace=trace)
+        session = getattr(ctx, "_trace", None)
+        if session is not None and session.active:
+            with session.module_purpose(self):
+                return TemplateModule(
+                    self,
+                    ctx,
+                    [x async for x in self.root_render_func(ctx)],  # type: ignore
+                )
         return TemplateModule(
             self,
             ctx,
@@ -1432,30 +1626,93 @@ class Template:
         if self.environment.is_async:
             raise RuntimeError("Module is not available in async mode.")
 
+        trace = getattr(ctx, "_trace", None) if ctx is not None else None
+        if trace is None or not trace.active:
+            trace = None
+
         if ctx is not None:
             keys = ctx.globals_keys - self.globals.keys()
 
             if keys:
-                return self.make_module({k: ctx.parent[k] for k in keys})
+                return self.make_module({k: ctx.parent[k] for k in keys}, trace=trace)
 
         if self._module is None:
-            self._module = self.make_module()
+            # The shared cached module is always rendered without a
+            # per-render tracing session, so sessions never leak across
+            # renders and its body is executed at most once.
+            self._module = self._make_shared_module()
 
         return self._module
 
     async def _get_default_module_async(
         self, ctx: Context | None = None
     ) -> "TemplateModule":
+        trace = getattr(ctx, "_trace", None) if ctx is not None else None
+        if trace is None or not trace.active:
+            trace = None
+
         if ctx is not None:
             keys = ctx.globals_keys - self.globals.keys()
 
             if keys:
-                return await self.make_module_async({k: ctx.parent[k] for k in keys})
+                return await self.make_module_async(
+                    {k: ctx.parent[k] for k in keys}, trace=trace
+                )
 
         if self._module is None:
-            self._module = await self.make_module_async()
+            self._module = await self._make_shared_module_async()
 
         return self._module
+
+    def _make_shared_module(self) -> "TemplateModule":
+        if getattr(self.environment, "enable_trace", False):
+            from .trace import no_session
+
+            with no_session():
+                return self.make_module()
+        return self.make_module()
+
+    async def _make_shared_module_async(self) -> "TemplateModule":
+        if getattr(self.environment, "enable_trace", False):
+            from .trace import no_session
+
+            with no_session():
+                return await self.make_module_async()
+        return await self.make_module_async()
+
+    def _trace_module_cached(self, with_context: bool, ctx: Context | None) -> bool:
+        """Whether an import will reuse an already rendered module."""
+        if with_context or ctx is None:
+            return False
+        keys = ctx.globals_keys - self.globals.keys()
+        if keys:
+            return False
+        return self._module is not None
+
+    def _trace_get_module(
+        self,
+        session: t.Any,
+        with_context: bool,
+        ctx: Context,
+        locals: dict[str, t.Any] | None,
+    ) -> "TemplateModule":
+        """Resolve a module for an instrumented ``import`` statement."""
+        if with_context:
+            return self.make_module(ctx.get_all(), True, locals, trace=session)
+        return self._get_default_module(ctx)
+
+    async def _trace_get_module_async(
+        self,
+        session: t.Any,
+        with_context: bool,
+        ctx: Context,
+        locals: dict[str, t.Any] | None,
+    ) -> "TemplateModule":
+        if with_context:
+            return await self.make_module_async(
+                ctx.get_all(), True, locals, trace=session
+            )
+        return await self._get_default_module_async(ctx)
 
     @property
     def module(self) -> "TemplateModule":

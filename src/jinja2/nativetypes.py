@@ -95,36 +95,82 @@ class NativeEnvironment(Environment):
 class NativeTemplate(Template):
     environment_class = NativeEnvironment
 
-    def render(self, *args: t.Any, **kwargs: t.Any) -> t.Any:
+    def render(self, *args: t.Any, trace: t.Any = None, **kwargs: t.Any) -> t.Any:
         """Render the template to produce a native Python type. If the
         result is a single node, its value is returned. Otherwise, the
         nodes are concatenated as strings. If the result can be parsed
         with :func:`ast.literal_eval`, the parsed value is returned.
         Otherwise, the string is returned.
         """
-        ctx = self.new_context(dict(*args, **kwargs))
+        session = self._prepare_trace(trace)
+        ctx = self.new_context(dict(*args, **kwargs), trace=session)
+
+        if session is None:
+            with self._trace_isolation(None):
+                try:
+                    return self.environment_class.concat(  # type: ignore
+                        self.root_render_func(ctx)
+                    )
+                except Exception:
+                    return self.environment.handle_exception()
+
+        session.begin("render", self, is_async=False)
+        gen = t.cast("t.Generator[t.Any, None, None]", self.root_render_func(ctx))
+
+        def traced() -> t.Iterator[t.Any]:
+            with session.activate():
+                try:
+                    for piece in gen:
+                        session.output(piece)
+                        yield piece
+                except GeneratorExit:
+                    session.mark_closed()
+                    raise
 
         try:
-            return self.environment_class.concat(  # type: ignore
-                self.root_render_func(ctx)
-            )
-        except Exception:
-            return self.environment.handle_exception()
+            return self.environment_class.concat(traced())  # type: ignore
+        except BaseException as exc:
+            self._safe_close_sync(gen)
+            raise session.fail(exc) from exc
+        finally:
+            session.finish()
 
-    async def render_async(self, *args: t.Any, **kwargs: t.Any) -> t.Any:
+    async def render_async(
+        self, *args: t.Any, trace: t.Any = None, **kwargs: t.Any
+    ) -> t.Any:
         if not self.environment.is_async:
             raise RuntimeError(
                 "The environment was not created with async mode enabled."
             )
 
-        ctx = self.new_context(dict(*args, **kwargs))
+        session = self._prepare_trace(trace)
+        ctx = self.new_context(dict(*args, **kwargs), trace=session)
 
+        if session is None:
+            with self._trace_isolation(None):
+                try:
+                    return self.environment_class.concat(  # type: ignore
+                        [n async for n in self.root_render_func(ctx)]  # type: ignore
+                    )
+                except Exception:
+                    return self.environment.handle_exception()
+
+        import asyncio
+
+        session.begin("render", self, is_async=True)
+        agen: t.AsyncGenerator[t.Any, None] = self.root_render_func(ctx)  # type: ignore
+        pieces: list[t.Any] = []
         try:
-            return self.environment_class.concat(  # type: ignore
-                [n async for n in self.root_render_func(ctx)]  # type: ignore
-            )
-        except Exception:
-            return self.environment.handle_exception()
+            with session.activate():
+                async for piece in agen:
+                    session.output(piece)
+                    pieces.append(piece)
+            return self.environment_class.concat(pieces)  # type: ignore
+        except (Exception, asyncio.CancelledError) as exc:
+            await self._safe_aclose(agen)
+            raise session.fail(exc) from exc
+        finally:
+            session.finish()
 
 
 NativeEnvironment.template_class = NativeTemplate

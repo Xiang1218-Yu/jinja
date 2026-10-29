@@ -662,6 +662,14 @@ class CodeGenerator(NodeVisitor):
         self.indent()
 
         self.buffer(frame)
+
+        if self.environment.enable_trace:
+            # Re-resolve the session per invocation: macros defined in a
+            # cached imported module close over the module's detached
+            # context and need the render driving the invocation.
+            self.writeline("_trace = context._trace")
+            self.writeline("if not _trace.active: _trace = _trace_current() or _trace")
+
         self.enter_frame(frame)
 
         self.push_parameter_definitions(frame)
@@ -696,11 +704,21 @@ class CodeGenerator(NodeVisitor):
         name = getattr(macro_ref.node, "name", None)
         if len(macro_ref.node.args) == 1:
             arg_tuple += ","
-        self.write(
-            f"Macro(environment, macro, {name!r}, ({arg_tuple}),"
-            f" {macro_ref.accesses_kwargs!r}, {macro_ref.accesses_varargs!r},"
-            f" {macro_ref.accesses_caller!r}, context.eval_ctx.autoescape)"
-        )
+        if self.environment.enable_trace:
+            # The defining template identity; the ``__jinja_template__``
+            # global is shadow proof unlike the module level ``name``.
+            self.write(
+                f"Macro(environment, macro, {name!r}, ({arg_tuple}),"
+                f" {macro_ref.accesses_kwargs!r}, {macro_ref.accesses_varargs!r},"
+                f" {macro_ref.accesses_caller!r}, context.eval_ctx.autoescape,"
+                f" __jinja_template__.name)"
+            )
+        else:
+            self.write(
+                f"Macro(environment, macro, {name!r}, ({arg_tuple}),"
+                f" {macro_ref.accesses_kwargs!r}, {macro_ref.accesses_varargs!r},"
+                f" {macro_ref.accesses_caller!r}, context.eval_ctx.autoescape)"
+            )
 
     def position(self, node: nodes.Node) -> str:
         """Return a human readable position for the node."""
@@ -727,6 +745,13 @@ class CodeGenerator(NodeVisitor):
         # always use the standard Undefined class for the implicit else of
         # conditional expressions
         self.writeline("cond_expr_undefined = Undefined")
+        if self.environment.enable_trace:
+            # Render tracing session. Nested macro functions close over
+            # this local; if the owning context is detached (a macro
+            # defined in a cached imported module) fall back to the
+            # session driving the current render.
+            self.writeline("_trace = context._trace")
+            self.writeline("if not _trace.active: _trace = _trace_current() or _trace")
         self.writeline("if 0: yield None")
 
     def push_parameter_definitions(self, frame: Frame) -> None:
@@ -864,12 +889,23 @@ class CodeGenerator(NodeVisitor):
         # add the load name
         self.writeline(f"name = {self.name!r}")
 
+        if self.environment.enable_trace:
+            # Marker read by Template._from_namespace so cross environment
+            # templates can be detected as (non) instrumented.
+            self.writeline("__jinja_trace__ = True")
+            self.writeline("from jinja2.trace import current_session as _trace_current")
+
         # generate the root render function.
         self.writeline(
             f"{self.func('root')}(context, missing=missing{envenv}):", extra=1
         )
         self.indent()
         self.write_commons()
+
+        if self.environment.enable_trace:
+            self.writeline("_trace.template_enter(__jinja_template__)")
+            self.writeline("try:")
+            self.indent()
 
         # process the root
         frame = Frame(eval_ctx)
@@ -894,18 +930,40 @@ class CodeGenerator(NodeVisitor):
                 self.writeline("if parent_template is not None:")
             self.indent()
             if not self.environment.is_async:
-                self.writeline("yield from parent_template.root_render_func(context)")
+                if self.environment.enable_trace:
+                    self.writeline(
+                        "yield from _trace.extends_root_sync("
+                        "parent_template, parent_template.root_render_func(context))"
+                    )
+                else:
+                    self.writeline(
+                        "yield from parent_template.root_render_func(context)"
+                    )
             else:
                 self.writeline("agen = parent_template.root_render_func(context)")
                 self.writeline("try:")
                 self.indent()
-                self.writeline("async for event in agen:")
+                if self.environment.enable_trace:
+                    self.writeline(
+                        "async for event in _trace.extends_root_async("
+                        "parent_template, agen):"
+                    )
+                else:
+                    self.writeline("async for event in agen:")
                 self.indent()
                 self.writeline("yield event")
                 self.outdent()
                 self.outdent()
                 self.writeline("finally: await agen.aclose()")
             self.outdent(1 + (not self.has_known_extends))
+
+        if self.environment.enable_trace:
+            self.writeline("finally:")
+            self.indent()
+            self.writeline("_trace.template_exit(__jinja_template__)")
+            self.outdent()
+            # Back from the root function body to module indentation.
+            self.outdent()
 
         # at this point we now have the blocks collected and can visit them too.
         for name, block in self.blocks.items():
@@ -916,6 +974,10 @@ class CodeGenerator(NodeVisitor):
             )
             self.indent()
             self.write_commons()
+            if self.environment.enable_trace:
+                self.writeline(f"_trace.block_enter(__jinja_template__, {name!r})")
+                self.writeline("try:")
+                self.indent()
             # It's important that we do not make this frame a child of the
             # toplevel template.  This would cause a variety of
             # interesting issues with identifier tracking.
@@ -936,6 +998,13 @@ class CodeGenerator(NodeVisitor):
             self.blockvisit(block.body, block_frame)
             self.leave_frame(block_frame, with_python_scope=True)
             self.outdent()
+            if self.environment.enable_trace:
+                self.writeline("finally:")
+                self.indent()
+                self.writeline(f"_trace.block_exit(__jinja_template__, {name!r})")
+                self.outdent()
+                # Back from the block function body to module indentation.
+                self.outdent()
 
         blocks_kv_str = ", ".join(f"{x!r}: block_{x}" for x in self.blocks)
         self.writeline(f"blocks = {{{blocks_kv_str}}}", extra=1)
@@ -1024,6 +1093,9 @@ class CodeGenerator(NodeVisitor):
         self.writeline("context.blocks.setdefault(name, []).append(parent_block)")
         self.outdent()
 
+        if self.environment.enable_trace:
+            self.writeline("_trace.extends(parent_template)")
+
         # if this extends statement was in the root level we can take
         # advantage of that information and simplify the generated code
         # in the top level from this point onwards
@@ -1035,6 +1107,10 @@ class CodeGenerator(NodeVisitor):
 
     def visit_Include(self, node: nodes.Include, frame: Frame) -> None:
         """Handles includes."""
+        if self.environment.enable_trace:
+            self._visit_include_traced(node, frame)
+            return
+
         if node.ignore_missing:
             self.writeline("try:")
             self.indent()
@@ -1091,9 +1167,103 @@ class CodeGenerator(NodeVisitor):
         if node.ignore_missing:
             self.outdent()
 
+    def _visit_include_traced(self, node: nodes.Include, frame: Frame) -> None:
+        """Tracing enabled variant of :meth:`visit_Include`."""
+        if node.ignore_missing:
+            self.writeline("try:")
+            self.indent()
+
+        func_name = "get_or_select_template"
+        if isinstance(node.template, nodes.Const):
+            if isinstance(node.template.value, str):
+                func_name = "get_template"
+            elif isinstance(node.template.value, (tuple, list)):
+                func_name = "select_template"
+        elif isinstance(node.template, (nodes.Tuple, nodes.List)):
+            func_name = "select_template"
+
+        self.writeline(f"template = environment.{func_name}(", node)
+        self.visit(node.template, frame)
+        self.write(f", {self.name!r})")
+
+        if node.ignore_missing:
+            self.outdent()
+            self.writeline("except TemplateNotFound:")
+            self.indent()
+            self.writeline("pass")
+            self.outdent()
+            self.writeline("else:")
+            self.indent()
+
+        def loop_body() -> None:
+            self.indent()
+            self.simple_write("event", frame)
+            self.outdent()
+
+        if node.with_context:
+            self.writeline(
+                f"_trace.include_enter(template, True, {node.ignore_missing!r})"
+            )
+            self.writeline(
+                "gen = template.root_render_func("
+                "template.new_context(context.get_all(), True,"
+                f" {self.dump_local_context(frame)}, trace=_trace))"
+            )
+            self.writeline("try:")
+            self.indent()
+            self.writeline(f"{self.choose_async()}for event in gen:")
+            loop_body()
+            self.outdent()
+            self.writeline("finally:")
+            self.indent()
+            self.writeline(self.choose_async("await gen.aclose()", "gen.close()"))
+            self.writeline("_trace.include_exit(template)")
+            self.outdent()
+        elif self.environment.is_async:
+            mod_var = self.temporary_identifier()
+            self.writeline(f"{mod_var} = await template._get_default_module_async()")
+            self.writeline(
+                f"{self.choose_async('async ')}for event in _trace.include_body_"
+                f"async(template, {mod_var}._body_stream):"
+            )
+            loop_body()
+        else:
+            mod_var = self.temporary_identifier()
+            self.writeline(f"{mod_var} = template._get_default_module()")
+            self.writeline(
+                f"yield from _trace.include_body_sync(template, {mod_var}._body_stream)"
+            )
+
+        if node.ignore_missing:
+            self.outdent()
+
     def _import_common(
         self, node: nodes.Import | nodes.FromImport, frame: Frame
     ) -> None:
+        if self.environment.enable_trace:
+            if isinstance(node, nodes.FromImport):
+                names = tuple(
+                    item[0] if isinstance(item, tuple) else item for item in node.names
+                )
+                binding = None
+            else:
+                names = None
+                binding = node.target
+
+            method = (
+                "import_module_async" if self.environment.is_async else "import_module"
+            )
+            self.write(f"{self.choose_async('await ')}_trace.{method}(")
+            self.write("environment.get_template(")
+            self.visit(node.template, frame)
+            self.write(f", {self.name!r}), {node.with_context!r}, context, ")
+            if node.with_context:
+                self.write(self.dump_local_context(frame))
+            else:
+                self.write("None")
+            self.write(f", names={names!r}, binding={binding!r})")
+            return
+
         self.write(f"{self.choose_async('await ')}environment.get_template(")
         self.visit(node.template, frame)
         self.write(f", {self.name!r}).")
