@@ -608,7 +608,10 @@ class CodeGenerator(NodeVisitor):
         return f"{self.choose_async()}def {name}"
 
     def macro_body(
-        self, node: nodes.Macro | nodes.CallBlock, frame: Frame
+        self,
+        node: nodes.Macro | nodes.CallBlock,
+        frame: Frame,
+        contract_spec: dict[str, t.Any] | None = None,
     ) -> tuple[Frame, MacroRef]:
         """Dump the function def of a macro or call block."""
         frame = frame.inner()
@@ -654,6 +657,27 @@ class CodeGenerator(NodeVisitor):
         if "varargs" in undeclared and "varargs" not in skip_special_params:
             args.append(frame.symbols.declare_parameter("varargs"))
             macro_ref.accesses_varargs = True
+
+        # A declared call contract may explicitly allow extra keyword or
+        # positional arguments even when the body does not reference
+        # ``kwargs`` / ``varargs``.  Make the generated function accept
+        # (and then ignore) them so the wrapper and the function signature
+        # stay in sync and the historical binder does not reject them.
+        if contract_spec is not None:
+            if (
+                contract_spec.get("extra_keyword")
+                and not macro_ref.accesses_kwargs
+                and "kwargs" not in skip_special_params
+            ):
+                args.append(frame.symbols.declare_parameter("kwargs"))
+                macro_ref.accesses_kwargs = True
+            if (
+                contract_spec.get("extra_positional")
+                and not macro_ref.accesses_varargs
+                and "varargs" not in skip_special_params
+            ):
+                args.append(frame.symbols.declare_parameter("varargs"))
+                macro_ref.accesses_varargs = True
 
         # macros are delayed, they never require output checks
         frame.require_output_check = False
@@ -1333,7 +1357,8 @@ class CodeGenerator(NodeVisitor):
             self.outdent()
 
     def visit_Macro(self, node: nodes.Macro, frame: Frame) -> None:
-        macro_frame, macro_ref = self.macro_body(node, frame)
+        contract_spec = self.macro_contract_spec(node)
+        macro_frame, macro_ref = self.macro_body(node, frame, contract_spec)
         self.newline()
         if frame.toplevel:
             if not node.name.startswith("_"):
@@ -1341,6 +1366,183 @@ class CodeGenerator(NodeVisitor):
             self.writeline(f"context.vars[{node.name!r}] = ")
         self.write(f"{frame.symbols.ref(node.name)} = ")
         self.macro_def(macro_ref, macro_frame)
+        if contract_spec is not None:
+            self.writeline(
+                f"environment.macro_contracts.bind("
+                f"{frame.symbols.ref(node.name)}, {contract_spec!r})",
+                node,
+            )
+
+    _MACRO_CONTRACT_KEYS = frozenset(
+        {
+            "version",
+            "required",
+            "optional",
+            "extra_positional",
+            "extra_keyword",
+            "require_caller",
+            "awaitable",
+        }
+    )
+
+    def macro_contract_spec(self, node: nodes.Macro) -> dict[str, t.Any] | None:
+        """Return a normalized, constant contract spec for ``node``.
+
+        Returns ``None`` when contracts are disabled or the macro has no
+        ``contract`` clause.  Raises a template assertion error at compile
+        time for any malformed contract.
+        """
+        if not getattr(self.environment, "macro_contract_enabled", False):
+            return None
+        contract_node = node.contract
+        if contract_node is None:
+            return None
+
+        eval_ctx = EvalContext(self.environment, self.name)
+        try:
+            raw = contract_node.as_const(eval_ctx)
+        except nodes.Impossible:
+            self.fail(
+                "macro contract may only contain constant values",
+                contract_node.lineno,
+            )
+
+        if not isinstance(raw, dict):
+            self.fail("macro contract must be a dictionary", contract_node.lineno)
+
+        unknown = set(raw) - set(self._MACRO_CONTRACT_KEYS)
+        if unknown:
+            self.fail(
+                "unknown macro contract option(s):"
+                f" {', '.join(sorted(map(repr, unknown)))}",
+                contract_node.lineno,
+            )
+
+        signature = [arg.name for arg in node.args]
+        n_args = len(signature)
+        n_defaults = len(node.defaults)
+        default_names = {
+            signature[i] for i in range(n_args) if i >= n_args - n_defaults
+        }
+        parameters = [name for name in signature if name != "caller"]
+        parameter_set = set(parameters)
+
+        version = raw.get("version", 1)
+        if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+            self.fail(
+                "macro contract 'version' must be a positive integer",
+                node.lineno,
+            )
+
+        def as_name_list(value: t.Any, key: str) -> list[str]:
+            if not isinstance(value, (list, tuple)) or isinstance(value, (str, bytes)):
+                self.fail(
+                    f"macro contract {key!r} must be a list of names",
+                    node.lineno,
+                )
+            names = []
+            for item in value:
+                if not isinstance(item, str) or not item:
+                    self.fail(
+                        f"macro contract {key!r} must only contain parameter names",
+                        node.lineno,
+                    )
+                names.append(item)
+            return names
+
+        required_raw = raw.get("required")
+        required = (
+            [name for name in parameters if name not in default_names]
+            if required_raw is None
+            else as_name_list(required_raw, "required")
+        )
+
+        defaults: dict[str, t.Any] = {}
+        optional_raw = raw.get("optional")
+        if optional_raw is None:
+            optional = [name for name in parameters if name in default_names]
+        elif isinstance(optional_raw, dict):
+            optional = list(optional_raw)
+            defaults = dict(optional_raw)
+        else:
+            optional = as_name_list(optional_raw, "optional")
+
+        required_set = set(required)
+        optional_set = set(optional)
+
+        overlap = required_set & optional_set
+        if overlap:
+            self.fail(
+                "macro contract parameter(s) declared both required and optional:"
+                f" {sorted(overlap)}",
+                node.lineno,
+            )
+        if "caller" in required_set or "caller" in optional_set:
+            self.fail(
+                "the special 'caller' argument is configured via 'require_caller'",
+                node.lineno,
+            )
+        undeclared = (required_set | optional_set) - parameter_set
+        if undeclared:
+            self.fail(
+                "macro contract parameter(s) not present in the macro signature:"
+                f" {sorted(undeclared)}",
+                node.lineno,
+            )
+        unlisted = parameter_set - (required_set | optional_set)
+        if unlisted:
+            self.fail(
+                "macro signature parameter(s) missing from the contract:"
+                f" {sorted(unlisted)}",
+                node.lineno,
+            )
+
+        for flag_name in ("extra_positional", "extra_keyword", "require_caller"):
+            if flag_name in raw and not isinstance(raw[flag_name], bool):
+                self.fail(
+                    f"macro contract option {flag_name!r} must be a boolean",
+                    node.lineno,
+                )
+
+        extra_positional = bool(raw.get("extra_positional", False))
+        extra_keyword = bool(raw.get("extra_keyword", False))
+        require_caller = bool(raw.get("require_caller", False))
+
+        awaitable = raw.get("awaitable", "any")
+        if awaitable not in ("sync", "async", "any"):
+            self.fail(
+                "macro contract 'awaitable' must be one of 'sync', 'async' or"
+                f" 'any', got {awaitable!r}",
+                node.lineno,
+            )
+
+        # ``require_caller`` only makes sense for a macro that accepts a
+        # caller (an explicit ``caller`` parameter or a body using it).
+        accesses_caller = (
+            "caller" in find_undeclared(node.body, ("caller", "kwargs", "varargs"))
+            or "caller" in signature
+        )
+        if require_caller and not accesses_caller:
+            self.fail(
+                "macro contract sets 'require_caller' but the macro neither declares"
+                " nor uses a 'caller' argument",
+                node.lineno,
+            )
+
+        ordered_required = [name for name in parameters if name in required_set]
+        optional_defaults = {
+            name: defaults.get(name) for name in parameters if name in optional_set
+        }
+
+        return {
+            "version": version,
+            "required": ordered_required,
+            "optional": optional_defaults,
+            "extra_positional": extra_positional,
+            "extra_keyword": extra_keyword,
+            "require_caller": require_caller,
+            "awaitable": awaitable,
+        }
 
     def visit_CallBlock(self, node: nodes.CallBlock, frame: Frame) -> None:
         call_frame, macro_ref = self.macro_body(node, frame)

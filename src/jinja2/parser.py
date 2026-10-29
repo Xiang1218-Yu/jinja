@@ -440,8 +440,29 @@ class Parser:
         node = nodes.Macro(lineno=next(self.stream).lineno)
         node.name = self.parse_assign_target(name_only=True).name
         self.parse_signature(node)
+        node.contract = self.parse_macro_contract()
         node.body = self.parse_statements(("name:endmacro",), drop_needle=True)
         return node
+
+    def parse_macro_contract(self) -> nodes.Expr | None:
+        """Parse an optional ``contract { ... }`` clause on a macro.
+
+        The clause is a constant dictionary literal placed between the
+        macro signature and the block end.  It is only parsed, all
+        validation happens at compile time.
+        """
+        current = self.stream.current
+        if current.type != "name" or current.value != "contract":
+            return None
+        next(self.stream)  # consume the 'contract' keyword
+        expr = self.parse_expression()
+        if not isinstance(expr, nodes.Dict):
+            self.fail(
+                "macro contract must be a dictionary literal,"
+                ' for example: contract {"required": ["title"]}',
+                expr.lineno,
+            )
+        return expr
 
     def parse_print(self) -> nodes.Output:
         node = nodes.Output(lineno=next(self.stream).lineno)

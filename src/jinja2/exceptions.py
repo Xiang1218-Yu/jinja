@@ -150,6 +150,65 @@ class TemplateRuntimeError(TemplateError):
     """
 
 
+class MacroContractError(TemplateRuntimeError):
+    """Raised when a macro is called in a way that violates its declared
+    call contract.
+
+    The :meth:`to_dict` method returns a structured, JSON serializable
+    description of the violation.  It always contains the macro name,
+    the arguments used for the call and the version of the contract that
+    was violated.
+
+    .. versionadded:: 3.2.0
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        macro_name: str | None,
+        reason: str,
+        contract_version: int,
+        call: dict[str, t.Any],
+        contract: dict[str, t.Any],
+        **extra: t.Any,
+    ) -> None:
+        super().__init__(message)
+        #: Human readable name of the macro that failed the contract.
+        self.macro_name = macro_name
+        #: Machine readable violation code.
+        self.reason = reason
+        #: Version of the contract that was checked.
+        self.contract_version = contract_version
+        #: Structured snapshot of the arguments passed to the call.
+        self.call = call
+        #: Structured view of the violated contract.
+        self.contract = contract
+        #: Additional reason specific information.
+        self.info = dict(extra)
+
+    @property
+    def arguments(self) -> dict[str, t.Any]:
+        """Alias for :attr:`call` -- the arguments of the failing call."""
+        return self.call
+
+    def to_dict(self) -> dict[str, t.Any]:
+        """Return the structured error as a dictionary made up of plain
+        Python types.
+        """
+        rv: dict[str, t.Any] = {
+            "type": type(self).__name__,
+            "message": str(self),
+            "reason": self.reason,
+            "macro_name": self.macro_name,
+            "contract_version": self.contract_version,
+            "call": self.call,
+            "contract": self.contract,
+        }
+        rv.update(self.info)
+        return rv
+
+
 class UndefinedError(TemplateRuntimeError):
     """Raised if a template tries to operate on :class:`Undefined`."""
 

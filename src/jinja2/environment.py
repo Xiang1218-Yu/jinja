@@ -45,6 +45,7 @@ from .lexer import TokenStream
 from .nodes import EvalContext
 from .parser import Parser
 from .runtime import Context
+from .runtime import MacroContractRegistry
 from .runtime import new_context
 from .runtime import Undefined
 from .utils import _PassArg
@@ -316,6 +317,7 @@ class Environment:
         auto_reload: bool = True,
         bytecode_cache: t.Optional["BytecodeCache"] = None,
         enable_async: bool = False,
+        macro_contracts: bool = False,
     ):
         # !!Important notice!!
         #   The constructor accepts quite a few arguments that should be
@@ -366,6 +368,13 @@ class Environment:
         self.extensions = load_extensions(self, extensions)
 
         self.is_async = enable_async
+
+        # macro call contracts are disabled by default.  The registry is
+        # a side table so macros themselves are never modified and macros
+        # without a contract keep the historical calling semantics.
+        self.macro_contract_enabled = macro_contracts
+        self.macro_contracts = MacroContractRegistry()
+
         _environment_config_check(self)
 
     def add_extension(self, extension: str | type["Extension"]) -> None:

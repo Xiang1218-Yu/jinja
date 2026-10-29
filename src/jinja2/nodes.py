@@ -348,6 +348,10 @@ class Macro(Stmt):
     """A macro definition.  `name` is the name of the macro, `args` a list of
     arguments and `defaults` a list of defaults if there are any.  `body` is
     a list of nodes for the macro body.
+
+    ``contract`` is not a regular AST field (it is not traversed as a child
+    node and does not change the positional constructor).  It holds an
+    optional constant dict expression describing the macro call contract.
     """
 
     fields = ("name", "args", "defaults", "body")
@@ -355,6 +359,10 @@ class Macro(Stmt):
     args: list["Name"]
     defaults: list["Expr"]
     body: list[Node]
+
+    #: Optional constant contract expression.  Populated by the parser and
+    #: read by the compiler; ignored by the generic node visitor.
+    contract: t.Optional["Expr"] = None
 
 
 class CallBlock(Stmt):

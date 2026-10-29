@@ -3,6 +3,7 @@
 import functools
 import sys
 import typing as t
+import weakref
 from collections import abc
 from itertools import chain
 
@@ -12,6 +13,7 @@ from markupsafe import soft_str
 
 from .async_utils import auto_aiter
 from .async_utils import auto_await  # noqa: F401
+from .exceptions import MacroContractError
 from .exceptions import TemplateNotFound  # noqa: F401
 from .exceptions import TemplateRuntimeError  # noqa: F401
 from .exceptions import UndefinedError
@@ -48,6 +50,10 @@ exported = [
     "LoopContext",
     "TemplateReference",
     "Macro",
+    "MacroContract",
+    "MacroContractRegistry",
+    "check_macro_contract",
+    "CONTRACT_VERSION",
     "Markup",
     "TemplateRuntimeError",
     "missing",
@@ -659,6 +665,393 @@ class AsyncLoopContext(LoopContext):
         return rv, self
 
 
+#: Version of the macro call contract schema understood by this runtime.
+CONTRACT_VERSION = 1
+
+#: Allowed values for the ``awaitable`` contract option.
+_CONTRACT_AWAITABLE = ("sync", "async", "any")
+
+#: Machine readable contract violation reasons.
+CONTRACT_REASON_AWAITABLE = "awaitable_mismatch"
+CONTRACT_REASON_MULTIPLE_VALUES = "multiple_values"
+CONTRACT_REASON_UNEXPECTED_KEYWORD = "unexpected_keyword_argument"
+CONTRACT_REASON_TOO_MANY_POSITIONAL = "too_many_positional_arguments"
+CONTRACT_REASON_MISSING_ARGUMENT = "missing_argument"
+CONTRACT_REASON_MISSING_CALLER = "missing_caller"
+
+
+def _safe_repr(value: t.Any) -> str:
+    """Return ``repr(value)`` without ever raising or consuming anything.
+
+    In particular ``repr`` on a generator only describes it, it never
+    iterates it, so this can safely be used to snapshot call arguments.
+    """
+    try:
+        return repr(value)
+    except Exception:
+        try:
+            return f"<unrepresentable {type(value).__name__}>"
+        except Exception:
+            return "<unrepresentable>"
+
+
+class MacroContract:
+    """Immutable description of how a :class:`Macro` may be called.
+
+    The contract itself is never stored on the macro and the checker only
+    reads the arguments that were passed to a call; it never mutates the
+    macro, the context or the call arguments and never consumes a
+    generator or invokes the ``caller``.
+    """
+
+    __slots__ = (
+        "name",
+        "parameters",
+        "required",
+        "optional",
+        "defaults",
+        "allow_varargs",
+        "allow_kwargs",
+        "caller_supported",
+        "explicit_caller_index",
+        "require_caller",
+        "awaitable",
+        "version",
+    )
+
+    def __init__(
+        self,
+        *,
+        name: str | None,
+        parameters: t.Sequence[str],
+        required: t.Iterable[str],
+        optional: t.Iterable[str],
+        defaults: t.Mapping[str, t.Any],
+        allow_varargs: bool,
+        allow_kwargs: bool,
+        caller_supported: bool,
+        explicit_caller_index: int | None,
+        require_caller: bool,
+        awaitable: str,
+        version: int,
+    ) -> None:
+        self.name = name
+        #: Parameter names in positional order, excluding ``caller``.
+        self.parameters = tuple(parameters)
+        self.required = frozenset(required)
+        self.optional = frozenset(optional)
+        #: Declared default values (metadata only).
+        self.defaults = dict(defaults)
+        self.allow_varargs = allow_varargs
+        self.allow_kwargs = allow_kwargs
+        self.caller_supported = caller_supported
+        self.explicit_caller_index = explicit_caller_index
+        self.require_caller = require_caller
+        self.awaitable = awaitable
+        self.version = version
+
+    def to_dict(self) -> dict[str, t.Any]:
+        """Return a structured view using plain builtin types."""
+        return {
+            "version": self.version,
+            "name": self.name,
+            "parameters": list(self.parameters),
+            "required": [p for p in self.parameters if p in self.required],
+            "optional": [p for p in self.parameters if p in self.optional],
+            "defaults": dict(self.defaults),
+            "extra_positional": self.allow_varargs,
+            "extra_keyword": self.allow_kwargs,
+            "caller_supported": self.caller_supported,
+            "require_caller": self.require_caller,
+            "awaitable": self.awaitable,
+        }
+
+
+def _coerce_param_names(value: t.Any, key: str) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, (list, tuple, set, frozenset)) or isinstance(
+        value, (str, bytes)
+    ):
+        raise TypeError(f"contract {key!r} must be a list of parameter names")
+    names = []
+    for item in value:
+        if not isinstance(item, str) or not item:
+            raise TypeError(f"contract {key!r} must only contain parameter names")
+        names.append(item)
+    return names
+
+
+def _build_contract(macro: "Macro", spec: t.Mapping[str, t.Any]) -> MacroContract:
+    """Create a :class:`MacroContract` for ``macro`` from a plain spec.
+
+    The declared parameter set has to match the macro signature exactly
+    so that definition and call use the same rules.  This is defensive;
+    template declared contracts are validated at compile time already.
+    """
+    if not isinstance(spec, abc.Mapping):
+        raise TypeError("macro contract spec must be a dict")
+
+    full = list(macro.arguments)
+    explicit_caller_index = full.index("caller") if "caller" in full else None
+    parameters = [name for name in full if name != "caller"]
+    declared = set(parameters)
+
+    version = spec.get("version", CONTRACT_VERSION)
+    if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+        raise TypeError("contract 'version' must be a positive integer")
+
+    required = _coerce_param_names(spec.get("required"), "required")
+    optional_raw = spec.get("optional", {})
+    if optional_raw is None:
+        optional = []
+        defaults: dict[str, t.Any] = {}
+    elif isinstance(optional_raw, abc.Mapping):
+        optional = [str(name) for name in optional_raw]
+        defaults = dict(optional_raw)
+    else:
+        optional = _coerce_param_names(optional_raw, "optional")
+        defaults = {}
+
+    required_set = frozenset(required)
+    optional_set = frozenset(optional)
+
+    overlap = required_set & optional_set
+    if overlap:
+        raise TypeError(
+            f"parameter(s) declared both required and optional: {sorted(overlap)!r}"
+        )
+    if "caller" in required_set or "caller" in optional_set:
+        raise TypeError("the special 'caller' parameter is configured separately")
+
+    declared_params = required_set | optional_set
+    unknown = declared_params - declared
+    if unknown:
+        raise TypeError(
+            f"contract parameter(s) {sorted(unknown)!r} are not part of macro"
+            f" {macro.name!r} signature {parameters!r}"
+        )
+    missing = declared - declared_params
+    if missing:
+        raise TypeError(
+            f"macro {macro.name!r} signature parameter(s) {sorted(missing)!r} are"
+            " missing from the contract"
+        )
+
+    allow_varargs = bool(spec.get("extra_positional", False))
+    allow_kwargs = bool(spec.get("extra_keyword", False))
+    require_caller = bool(spec.get("require_caller", False))
+    awaitable = spec.get("awaitable", "any")
+    if awaitable not in _CONTRACT_AWAITABLE:
+        raise TypeError(
+            f"contract 'awaitable' must be one of {_CONTRACT_AWAITABLE!r},"
+            f" got {awaitable!r}"
+        )
+
+    caller_supported = bool(macro.caller) or bool(macro.explicit_caller)
+    if require_caller and not caller_supported:
+        raise TypeError(
+            f"macro {macro.name!r} contract requires a caller but the macro does"
+            " not declare or use one"
+        )
+
+    # Keep a stable, signature based ordering.
+    required_ordered = [name for name in parameters if name in required_set]
+    optional_ordered = [name for name in parameters if name in optional_set]
+
+    return MacroContract(
+        name=macro.name,
+        parameters=parameters,
+        required=required_ordered,
+        optional=optional_ordered,
+        defaults=defaults,
+        allow_varargs=allow_varargs,
+        allow_kwargs=allow_kwargs,
+        caller_supported=caller_supported,
+        explicit_caller_index=explicit_caller_index,
+        require_caller=require_caller,
+        awaitable=awaitable,
+        version=version,
+    )
+
+
+class MacroContractRegistry:
+    """Maps :class:`Macro` instances to their :class:`MacroContract`.
+
+    The registry is a side table: attaching a contract here never alters
+    the macro object itself, so importing, aliasing or passing a macro
+    around transparently carries its contract while macros without a
+    contract keep the historical calling semantics.  Weak references
+    ensure registered macros can still be garbage collected.
+    """
+
+    __slots__ = ("_contracts",)
+
+    def __init__(self) -> None:
+        self._contracts: weakref.WeakKeyDictionary[Macro, MacroContract] = (
+            weakref.WeakKeyDictionary()
+        )
+
+    def bind(
+        self, macro: "Macro", spec: t.Mapping[str, t.Any] | MacroContract
+    ) -> MacroContract:
+        """Attach ``spec`` (or an existing contract) to ``macro``."""
+        if not isinstance(macro, Macro):
+            raise TypeError("a macro contract can only be bound to a Macro instance")
+        if isinstance(spec, MacroContract):
+            contract = spec
+        else:
+            contract = _build_contract(macro, spec)
+        self._contracts[macro] = contract
+        return contract
+
+    def get(self, macro: "Macro") -> MacroContract | None:
+        return self._contracts.get(macro)
+
+    def unbind(self, macro: "Macro") -> bool:
+        return self._contracts.pop(macro, None) is not None
+
+    def __contains__(self, macro: object) -> bool:
+        return macro in self._contracts
+
+    def __len__(self) -> int:
+        return len(self._contracts)
+
+    def __getstate__(self) -> dict[str, t.Any]:
+        # The weak key table cannot be pickled and does not need to be:
+        # contracts are rebound when a template module renders.
+        return {"macro_contract_registry": True}
+
+    def __setstate__(self, state: t.Any) -> None:
+        self._contracts = weakref.WeakKeyDictionary()
+
+
+def _snapshot_call(
+    args: tuple[t.Any, ...], kwargs: t.Mapping[str, t.Any]
+) -> dict[str, t.Any]:
+    """Build a structured, non consuming snapshot of a call's arguments."""
+    return {
+        "args": [_safe_repr(value) for value in args],
+        "kwargs": {key: _safe_repr(value) for key, value in kwargs.items()},
+        "argc": len(args),
+        "kwarg_names": list(kwargs.keys()),
+    }
+
+
+def check_macro_contract(
+    macro: "Macro",
+    contract: MacroContract,
+    args: tuple[t.Any, ...],
+    kwargs: t.Mapping[str, t.Any],
+) -> None:
+    """Validate a macro call against ``contract``.
+
+    This only inspects ``len(args)`` and the keys of ``kwargs``; it never
+    iterates argument values, never pops from ``kwargs`` and never calls
+    the ``caller``.  On failure it raises :class:`MacroContractError`.
+    """
+    env = macro._environment
+    name = contract.name
+
+    def fail(reason: str, message: str, **extra: t.Any) -> "te.NoReturn":
+        raise MacroContractError(
+            message,
+            macro_name=name,
+            reason=reason,
+            contract_version=contract.version,
+            call=_snapshot_call(args, kwargs),
+            contract=contract.to_dict(),
+            **extra,
+        )
+
+    if contract.awaitable == "async" and not env.is_async:
+        fail(
+            CONTRACT_REASON_AWAITABLE,
+            f"macro {name!r} contract requires an async (awaited) call",
+            expected="async",
+            actual="sync",
+        )
+    if contract.awaitable == "sync" and env.is_async:
+        fail(
+            CONTRACT_REASON_AWAITABLE,
+            f"macro {name!r} contract requires a synchronous call",
+            expected="sync",
+            actual="async",
+        )
+
+    n_args = len(args)
+    full = macro.arguments
+    index = {param: idx for idx, param in enumerate(full)}
+    positional_names = {full[i] for i in range(min(n_args, len(full)))}
+
+    if not contract.allow_kwargs:
+        for key in kwargs:
+            if key == "caller":
+                if not contract.caller_supported:
+                    fail(
+                        CONTRACT_REASON_UNEXPECTED_KEYWORD,
+                        f"macro {name!r} contract does not accept a 'caller'",
+                        argument="caller",
+                    )
+                if (
+                    contract.explicit_caller_index is not None
+                    and contract.explicit_caller_index < n_args
+                ):
+                    fail(
+                        CONTRACT_REASON_MULTIPLE_VALUES,
+                        f"macro {name!r} was invoked with two values for the"
+                        " special 'caller' argument",
+                        argument="caller",
+                    )
+                continue
+
+            if key in positional_names:
+                fail(
+                    CONTRACT_REASON_MULTIPLE_VALUES,
+                    f"macro {name!r} got multiple values for argument {key!r}",
+                    argument=key,
+                )
+            if key not in index:
+                fail(
+                    CONTRACT_REASON_UNEXPECTED_KEYWORD,
+                    f"macro {name!r} contract does not accept keyword argument {key!r}",
+                    argument=key,
+                )
+
+    if not contract.allow_varargs and n_args > len(full):
+        fail(
+            CONTRACT_REASON_TOO_MANY_POSITIONAL,
+            f"macro {name!r} contract takes at most {len(full)} positional"
+            f" argument(s) but {n_args} were given",
+            maximum=len(full),
+            given=n_args,
+        )
+
+    missing = [
+        param
+        for param in contract.parameters
+        if param in contract.required and index[param] >= n_args and param not in kwargs
+    ]
+    if missing:
+        fail(
+            CONTRACT_REASON_MISSING_ARGUMENT,
+            f"macro {name!r} contract is missing required argument(s):"
+            f" {', '.join(repr(m) for m in missing)}",
+            missing=missing,
+        )
+
+    if contract.require_caller:
+        caller_given = "caller" in kwargs or (
+            contract.explicit_caller_index is not None
+            and contract.explicit_caller_index < n_args
+        )
+        if not caller_given:
+            fail(
+                CONTRACT_REASON_MISSING_CALLER,
+                f"macro {name!r} contract requires a 'caller' but none was provided",
+            )
+
+
 class Macro:
     """Wraps a macro function."""
 
@@ -715,6 +1108,16 @@ class Macro:
             args = args[1:]
         else:
             autoescape = self._default_autoescape
+
+        # Macro call contracts are opt-in per environment.  The check is
+        # read-only: it runs before any argument is consumed or mutated
+        # and a macro without a contract falls through to the historical
+        # argument handling below.
+        if getattr(self._environment, "macro_contract_enabled", False):
+            registry = getattr(self._environment, "macro_contracts", None)
+            contract = registry.get(self) if registry is not None else None
+            if contract is not None:
+                check_macro_contract(self, contract, args, kwargs)
 
         # try to consume the positional arguments
         arguments = list(args[: self._argument_count])
